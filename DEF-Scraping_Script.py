@@ -1,30 +1,32 @@
 import os
 import cv2
 import yt_dlp
-#import ffmpeg
-import imageio_ffmpeg
+import ffmpeg
 import moviepy
 import pytesseract
 import shutil
 import numpy as np
 import time
+import uuid
+import csv
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy import VideoFileClip
 from difflib import SequenceMatcher
 from urllib.parse import urlparse, parse_qs
+import multiprocessing
 
 # Set Tesseract executable path if needed
-#pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
-os.environ["FFMPEG_BINARY"] = imageio_ffmpeg.get_ffmpeg_exe()
-
+pytesseract.pytesseract.tesseract_cmd = r"C:\Users\rchar\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
 # Configuration
-BASE_OUTPUT_DIR = r"D:\WOTD"
+BASE_OUTPUT_DIR = r"D:\WOTD\New"  # Base folder where global Meaning and Sentence folders will reside.
 FPS = 1
 TEXT_SIMILARITY_THRESHOLD = 0.5
 
-# Dictionary to store ROI coordinates for each playlist (for first pass)
-playlist_coords = {}
+# Create global output folders for Meaning and Sentence
+MEANING_FOLDER = os.path.join(BASE_OUTPUT_DIR, "Meaning")
+SENTENCE_FOLDER = os.path.join(BASE_OUTPUT_DIR, "Sentence")
+os.makedirs(MEANING_FOLDER, exist_ok=True)
+os.makedirs(SENTENCE_FOLDER, exist_ok=True)
 
 def get_playlist_info(url):
     print(f"Fetching playlist information from {url} ...")
@@ -44,7 +46,6 @@ def get_playlist_info(url):
         "no_warnings": True,
         "ignoreerrors": True
     }
-    
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
@@ -154,7 +155,15 @@ def select_crop_region(image_path, region_name):
             roi = (refPt[0][0], refPt[0][1], refPt[1][0]-refPt[0][0], refPt[1][1]-refPt[0][1])
             cv2.rectangle(image, refPt[0], refPt[1], (0,255,0), 2)
             cv2.imshow(f"Select {region_name} Region", image)
-    cv2.namedWindow(f"Select {region_name} Region")
+    #cv2.namedWindow(f"Select {region_name} Region")
+    # allow manual resize & full‐image display
+    cv2.namedWindow(f"Select {region_name} Region", cv2.WINDOW_NORMAL)
+
+    # immediately resize the window to match the image’s resolution
+    # note: image.shape is (height, width, channels)
+    h, w = image.shape[:2]
+    cv2.resizeWindow(f"Select {region_name} Region", w, h)
+
     cv2.setMouseCallback(f"Select {region_name} Region", click_and_crop)
     while True:
         cv2.imshow(f"Select {region_name} Region", image)
@@ -192,19 +201,14 @@ def get_frame_text(image, text_coords):
     gray = cv2.cvtColor(text_region, cv2.COLOR_BGR2GRAY)
     return pytesseract.image_to_string(gray).strip()
 
-# --- Modified detect_text_intervals using two text ROI selections ---
 def detect_text_intervals(frames_folder, text_coords_tuple, desc_lines):
     """
     Detect intervals in which each expected description line is visible.
-    
     Uses two text ROI selections:
-      - For the first description line (desc_lines[0]), use text_coords_tuple[0].
-      - For all remaining lines, use text_coords_tuple[1].
-    
-    Waits until a description line is detected (with a stability threshold) to mark segment start,
-    then marks the segment end when that description stops being detected.
-    After a segment ends, rewinds by 2 seconds (frames) and resumes scanning.
-    
+      - For the first description line, use text_coords_tuple[0].
+      - For the remaining lines, use text_coords_tuple[1].
+    Waits until a description line is detected to mark the segment start,
+    then marks its end when the description stops being detected.
     Returns a list of tuples: (start_time, end_time, description)
     """
     print("\nDetecting text intervals...")
@@ -226,13 +230,7 @@ def detect_text_intervals(frames_folder, text_coords_tuple, desc_lines):
             i += 1
             continue
 
-        # Choose ROI based on description index:
-        # Use the first text ROI for the first description; otherwise, use the second text ROI.
-        if current_desc_idx == 0:
-            current_roi = text_coords_tuple[0]
-        else:
-            current_roi = text_coords_tuple[1]
-
+        current_roi = text_coords_tuple[0] if current_desc_idx == 0 else text_coords_tuple[1]
         ocr_text = get_frame_text(image, current_roi)
         expected_line = desc_lines[current_desc_idx]
         similarity = get_text_similarity(ocr_text, expected_line)
@@ -269,15 +267,6 @@ def detect_text_intervals(frames_folder, text_coords_tuple, desc_lines):
         print(f"Ended segment for '{desc_lines[current_desc_idx]}' at {end_time}s (end of video)")
     
     return intervals
-# --- End modified function ---
-
-def create_segment_folder(base_folder, segment_num, description):
-    folder_path = os.path.join(base_folder, f"segment_{segment_num:02d}")
-    os.makedirs(folder_path, exist_ok=True)
-    desc_file = os.path.join(folder_path, "description.txt")
-    with open(desc_file, 'w', encoding='utf-8') as f:
-        f.write(description)
-    return folder_path
 
 def clip_video_segment(video_file, start_sec, end_sec, output_file, person_crop_coords):
     print(f"Processing segment from {start_sec} to {end_sec} seconds...")
@@ -287,7 +276,7 @@ def clip_video_segment(video_file, start_sec, end_sec, output_file, person_crop_
     (ffmpeg
      .input(video_file, ss=start_sec, t=duration)
      .crop(x, y, w, h)
-     .output(output_file, 
+     .output(output_file,
              video_bitrate='5000k',
              acodec='aac',
              vcodec='libx264',
@@ -298,80 +287,95 @@ def clip_video_segment(video_file, start_sec, end_sec, output_file, person_crop_
      .overwrite_output()
      .run(quiet=True))
 
-def merge_duplicate_segments(output_folder):
-    print("\nChecking for duplicate segments to merge...")
-    segment_folders = sorted([f for f in os.listdir(output_folder) if f.startswith("segment_")])
-    descriptions = {}
-    for folder in segment_folders:
-        folder_path = os.path.join(output_folder, folder)
-        desc_file = os.path.join(folder_path, "description.txt")
-        with open(desc_file, 'r', encoding='utf-8') as f:
-            desc = f.read().strip()
-        if desc not in descriptions:
-            descriptions[desc] = [folder]
-        else:
-            descriptions[desc].append(folder)
-    for desc, folders in descriptions.items():
-        if len(folders) > 1:
-            print(f"Merging segments for description: '{desc}'")
-            clips = []
-            for folder in folders:
-                video_path = os.path.join(output_folder, folder, "video.mp4")
-                clips.append(VideoFileClip(video_path))
-            final_clip = concatenate_videoclips(clips)
-            first_folder = os.path.join(output_folder, folders[0])
-            final_clip.write_videofile(os.path.join(first_folder, "video.mp4"))
-            final_clip.close()
-            for clip in clips:
-                clip.close()
-            for folder in folders[1:]:
-                shutil.rmtree(os.path.join(output_folder, folder))
-            print(f"Merged {len(folders)} segments into {folders[0]}")
-
 def process_video(video_info, playlist_name, text_coords_tuple, person_coords):
-    video_title = "".join(c for c in video_info['title'] if c.isalnum() or c in (' ', '-', '_')).strip()
-    print(f"\nProcessing video: {video_title}")
-    video_base_dir = os.path.join(BASE_OUTPUT_DIR, playlist_name, video_title)
-    temp_dir = os.path.join(video_base_dir, "temp")
-    frames_dir = os.path.join(temp_dir, "frames")
-    output_dir = os.path.join(video_base_dir, "segments")
-    os.makedirs(temp_dir, exist_ok=True)
-    os.makedirs(frames_dir, exist_ok=True)
-    os.makedirs(output_dir, exist_ok=True)
-    video_file = os.path.join(temp_dir, "video.mp4")
-    info = download_video_and_get_info(video_info['url'], video_file)
-    description = info.get("description", "")
-    desc_lines = [line.strip() for line in description.splitlines() if line.strip()]
-    if not desc_lines:
-        print("No description lines found. Skipping video.")
-        shutil.rmtree(temp_dir)
-        return True
-    extract_frames(video_file, frames_dir, fps=FPS)
-    segments = detect_text_intervals(frames_dir, text_coords_tuple, desc_lines)
-    # If no segments found, try using only the second ROI for detection.
-    if not segments:
-        print("No text intervals detected using initial ROI pair. Reprocessing with second text ROI only...")
-        segments = detect_text_intervals(frames_dir, (text_coords_tuple[1], text_coords_tuple[1]), desc_lines)
-        if not segments:
-            print("Still no text intervals detected. Marking video as failed.")
+    """
+    Processes one video:
+      - Downloads the video.
+      - Extracts frames and detects text intervals.
+      - For each segment:
+            * If its description contains "meaning" or "example" (case-insensitive) 
+              or contains "1)", "2)", or "3)", store the segment in the global Sentence folder.
+            * Otherwise, store in the global Meaning folder.
+            * A CSV row is generated for each segment: [unique_id, video_title, description].
+      - If no segments are detected, temporary files are removed.
+    Returns (success, meaning_rows, sentence_rows)
+    """
+    try:
+        video_title = "".join(c for c in video_info['title'] if c.isalnum() or c in (' ', '-', '_')).strip()
+        print(f"\nProcessing video: {video_title}")
+        temp_dir = os.path.join(BASE_OUTPUT_DIR, "temp", str(uuid.uuid4()))
+        os.makedirs(temp_dir, exist_ok=True)
+    
+        video_file = os.path.join(temp_dir, "video.mp4")
+        info = download_video_and_get_info(video_info['url'], video_file)
+        description = info.get("description", "")
+        desc_lines = [line.strip() for line in description.splitlines() if line.strip()]
+        if not desc_lines:
+            print("No description lines found. Skipping video.")
             shutil.rmtree(temp_dir)
-            return False
-    with VideoFileClip(video_file) as clip:
-        video_duration = int(clip.duration)
-    segments = [(round(s, 3), round(e, 3), d) for s, e, d in segments]
-    print("\nCreating segments...")
-    for i, (start, end, desc) in enumerate(segments, 1):
-        segment_folder = create_segment_folder(output_dir, i, desc)
-        segment_file = os.path.join(segment_folder, "video.mp4")
-        clip_video_segment(video_file, start, end, segment_file, person_coords)
-        print(f"Created segment {i} ({start}s to {end}s)")
-    merge_duplicate_segments(output_dir)
-    shutil.rmtree(temp_dir)
-    print(f"Completed processing video: {video_title}")
-    return True
+            return True, [], []
+    
+        frames_dir = os.path.join(temp_dir, "frames")
+        extract_frames(video_file, frames_dir, fps=FPS)
+        segments = detect_text_intervals(frames_dir, text_coords_tuple, desc_lines)
+        if not segments:
+            print("No text intervals detected using initial ROI pair. Reprocessing with second text ROI only...")
+            segments = detect_text_intervals(frames_dir, (text_coords_tuple[1], text_coords_tuple[1]), desc_lines)
+            if not segments:
+                print("Still no text intervals detected. Marking video as failed.")
+                shutil.rmtree(temp_dir)
+                return False, [], []
+    
+        segments = [(round(s, 3), round(e, 3), d) for s, e, d in segments]
+        video_uid = str(uuid.uuid4())
+        meaning_rows = []   # Rows for segments saved in Meaning folder
+        sentence_rows = []  # Rows for segments saved in Sentence folder
+        print("\nCreating segment files...")
+
+        for seg in segments:
+            s, e, seg_desc = seg
+            # Check if the segment text contains "meaning" or "example" (case-insensitive) 
+            # or if it contains "1)", "2)", or "3)".
+            if ("meaning" in seg_desc.lower() or 
+                "example" in seg_desc.lower() or 
+                "1)" in seg_desc or "2)" in seg_desc or "3)" in seg_desc):
+                out_folder = SENTENCE_FOLDER
+                segment_type = "sentence"
+            else:
+                out_folder = MEANING_FOLDER
+                segment_type = "meaning"
+        
+            segment_file = os.path.join(out_folder, f"{video_uid}_{segment_type}_{s}_{e}.mp4")
+            clip_video_segment(video_file, s, e, segment_file, person_coords)
+            row = [video_uid, video_title, seg_desc]
+            if segment_type == "sentence":
+                sentence_rows.append(row)
+                print(f"Created Sentence segment for video UID {video_uid} from {s}s to {e}s")
+            else:
+                meaning_rows.append(row)
+                print(f"Created Meaning segment for video UID {video_uid} from {s}s to {e}s")
+    
+        shutil.rmtree(temp_dir)
+        print(f"Completed processing video: {video_title}")
+        return True, meaning_rows, sentence_rows
+    except Exception:
+        import traceback
+        with open("worker_error.log", "a") as f:
+            f.write(traceback.format_exc())
+        return False, [], []
+def append_or_write_csv(csv_path, header, rows):
+    # If the file exists, open in append mode; otherwise, write header and rows.
+    mode = 'a' if os.path.exists(csv_path) else 'w'
+    with open(csv_path, mode=mode, newline='', encoding='utf-8') as csvfile:
+        csv_writer = csv.writer(csvfile)
+        if mode == 'w':
+            csv_writer.writerow(header)
+        csv_writer.writerows(rows)
 
 def main():
-    # Prompt for multiple playlist URLs
+    all_meaning_rows = []
+    all_sentence_rows = []
+    common_rows = []  # Combined rows for common CSV
     playlist_urls = []
     print("Enter YouTube playlist URLs (enter an empty line to finish):")
     while True:
@@ -383,11 +387,10 @@ def main():
         print("No playlists provided. Exiting.")
         return
 
-    # --- First Pass ---
-    # Use the first playlist's first video for initial ROI selection (applied for all playlists)
+    # --- First Pass: ROI selection from the first playlist's first video ---
     first_playlist_url = playlist_urls[0]
     first_playlist_name, first_videos = get_playlist_info(first_playlist_url)
-    first_playlist_dir = os.path.join(BASE_OUTPUT_DIR, first_playlist_name)
+    first_playlist_dir = os.path.join(BASE_OUTPUT_DIR, "temp_roi")
     os.makedirs(first_playlist_dir, exist_ok=True)
     temp_video_file = os.path.join(first_playlist_dir, "temp_video.mp4")
     download_video_and_get_info(first_videos[0]['url'], temp_video_file)
@@ -414,23 +417,27 @@ def main():
     global_roi = {'text': (text_coords_first, text_coords_remaining), 'person': person_coords}
     os.remove(temp_video_file)
     os.remove(screenshot_path)
+    shutil.rmtree(first_playlist_dir)
     
-    all_failed = []  # List of tuples: (playlist_name, video_info)
+    all_failed = []
     for playlist_url in playlist_urls:
         playlist_name, videos = get_playlist_info(playlist_url)
         print(f"\nProcessing playlist: {playlist_name}")
-        playlist_dir = os.path.join(BASE_OUTPUT_DIR, playlist_name)
-        os.makedirs(playlist_dir, exist_ok=True)
         failed_videos = []
         with ProcessPoolExecutor() as executor:
             future_to_video = {executor.submit(process_video, video, playlist_name, global_roi['text'], global_roi['person']): video for video in videos}
             for future in as_completed(future_to_video):
                 video = future_to_video[future]
                 try:
-                    success = future.result()
+                    success, meaning_rows, sentence_rows = future.result()
                     if not success:
                         print(f"Video '{video['title']}' failed in first pass.")
                         failed_videos.append(video)
+                    else:
+                        all_meaning_rows.extend(meaning_rows)
+                        all_sentence_rows.extend(sentence_rows)
+                        common_rows.extend(meaning_rows)
+                        common_rows.extend(sentence_rows)
                 except Exception as exc:
                     print(f"Video '{video['title']}' generated an exception: {exc}")
                     failed_videos.append(video)
@@ -439,13 +446,13 @@ def main():
             for video in failed_videos:
                 all_failed.append((playlist_name, video))
     
-    # --- Second Pass ---
+    # --- Second Pass for failed videos (if any) ---
     if all_failed:
         print(f"\n{len(all_failed)} videos across playlists did not yield text intervals in the first pass.")
         print("Proceeding to second pass for these videos.")
-        # Use the first failed video's playlist for ROI selection.
         failed_playlist_name, failed_video = all_failed[0]
-        playlist_dir = os.path.join(BASE_OUTPUT_DIR, failed_playlist_name)
+        playlist_dir = os.path.join(BASE_OUTPUT_DIR, "temp_retry")
+        os.makedirs(playlist_dir, exist_ok=True)
         temp_video_file = os.path.join(playlist_dir, "temp_video_retry.mp4")
         download_video_and_get_info(failed_video['url'], temp_video_file)
         with VideoFileClip(temp_video_file) as clip:
@@ -478,16 +485,45 @@ def main():
                     all_failed = []
                 else:
                     new_text_roi_tuple = (new_text_roi_first, new_text_roi_remaining)
-                    # Process failed videos concurrently in second pass.
                     with ProcessPoolExecutor() as executor:
                         future_to_failed = {executor.submit(process_video, video, playlist_name, new_text_roi_tuple, new_person_roi): (playlist_name, video) for (playlist_name, video) in all_failed}
                         for future in as_completed(future_to_failed):
                             pl_name, video = future_to_failed[future]
                             try:
-                                future.result()
+                                success, meaning_rows, sentence_rows = future.result()
+                                if not success:
+                                    print(f"Video '{video['title']}' in playlist {pl_name} failed in second pass.")
+                                else:
+                                    all_meaning_rows.extend(meaning_rows)
+                                    all_sentence_rows.extend(sentence_rows)
+                                    common_rows.extend(meaning_rows)
+                                    common_rows.extend(sentence_rows)
                             except Exception as exc:
                                 print(f"Video '{video['title']}' in playlist {pl_name} generated an exception during second pass: {exc}")
+        if os.path.exists(playlist_dir):
+            shutil.rmtree(playlist_dir)
+    
+    header = ["Unique_ID", "Video_Title", "Description"]
+    # Write (or append to) CSV file for Meaning folder
+    meaning_csv_path = os.path.join(MEANING_FOLDER, "segments.csv")
+    append_or_write_csv(meaning_csv_path, header, all_meaning_rows)
+    print(f"\nMeaning CSV file created/updated at: {meaning_csv_path}")
+    
+    # Write (or append to) CSV file for Sentence folder
+    sentence_csv_path = os.path.join(SENTENCE_FOLDER, "segments.csv")
+    append_or_write_csv(sentence_csv_path, header, all_sentence_rows)
+    print(f"\nSentence CSV file created/updated at: {sentence_csv_path}")
+    
+    # Write (or append to) common CSV file
+    common_csv_path = os.path.join(BASE_OUTPUT_DIR, "video_segments_common.csv")
+    append_or_write_csv(common_csv_path, header, common_rows)
+    print(f"\nCommon CSV file created/updated at: {common_csv_path}")
+    
     print("\nCompleted processing all playlists.")
+
+
+multiprocessing.freeze_support()
+multiprocessing.set_start_method("spawn", force=True)
 
 if __name__ == "__main__":
     main()
