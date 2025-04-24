@@ -14,3 +14,4 @@ The repo includes,
 3. One_Shot_Sign_Language_Recognition_Improved_Feature_Pooling_and_Fusion_Techniques(PCA,_GeM,_Vel_Attn).ipynb: GeM, PCA pooling on I3D and infusing velocity.
 4. Mahalanobis,_PCA_and_Velocity.ipynb: I3D, Mahalanobis, GeM and Velocity and trying to combine these with different methods and hyper-parameters.
 5. Experimenting with all different models including combining some of the best models: Different models to combine our best methods and trying new models as well to push top-1, 5 and 10 accuracies.
+6. Best_model.ipynb: The final best model - PCA and ZCA Ensemble
